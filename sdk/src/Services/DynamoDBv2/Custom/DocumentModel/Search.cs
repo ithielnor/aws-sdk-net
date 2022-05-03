@@ -184,11 +184,20 @@ namespace Amazon.DynamoDBv2.DocumentModel
         /// <summary>
         /// Gets the total number of items that match the search parameters.
         /// 
-        /// If IsDone is true and CollectResults is true, returns Matches.Count.
+        /// If IsDone is true, returns the cached sum matching results.
         /// Otherwise, makes a call to DynamoDB to find out the number of
-        /// matching items, without retrieving the items. Count is then cached.
+        /// matching items, without retrieving the items. Count and ScannedCount are then cached.
         /// </summary>
         public int Count { get { return GetCount(); } }
+
+        /// <summary>
+        /// Gets the total number of items in the query set regardless of whether they match the search parameters.
+        /// 
+        /// If IsDone is true, returns the cached sum of scanned items.
+        /// Otherwise, makes a call to DynamoDB to find out the number of
+        /// items, without retrieving the items. ScannedCount and Count are then cached.
+        /// </summary>
+        public int ScannedCount { get { return GetScannedCount(); } }
 
         /// <summary>
         /// Name of the index to query or scan against.
@@ -241,6 +250,9 @@ namespace Amazon.DynamoDBv2.DocumentModel
                         SourceTable.AddRequestHandler(scanReq, isAsync: false);
 
                         var scanResult = SourceTable.DDBClient.Scan(scanReq);
+                        count = Math.Max(0, count) + scanResult.Count;
+                        scannedCount = Math.Max(0, scannedCount) + scanResult.ScannedCount;
+
                         foreach (var item in scanResult.Items)
                         {
                             Document doc = SourceTable.FromAttributeMap(item);
@@ -283,6 +295,9 @@ namespace Amazon.DynamoDBv2.DocumentModel
                         SourceTable.AddRequestHandler(queryReq, isAsync: false);
 
                         var queryResult = SourceTable.DDBClient.Query(queryReq);
+                        count = Math.Max(0, count) + queryResult.Count;
+                        scannedCount = Math.Max(0, scannedCount) + queryResult.ScannedCount;
+
                         foreach (var item in queryResult.Items)
                         {
                             Document doc = SourceTable.FromAttributeMap(item);
@@ -343,6 +358,9 @@ namespace Amazon.DynamoDBv2.DocumentModel
                         SourceTable.AddRequestHandler(scanReq, isAsync: true);
 
                         var scanResult = await SourceTable.DDBClient.ScanAsync(scanReq, cancellationToken).ConfigureAwait(false);
+                        count = Math.Max(0, count) + scanResult.Count;
+                        scannedCount = Math.Max(0, scannedCount) + scanResult.ScannedCount;
+
                         foreach (var item in scanResult.Items)
                         {
                             Document doc = SourceTable.FromAttributeMap(item);
@@ -385,6 +403,9 @@ namespace Amazon.DynamoDBv2.DocumentModel
                         SourceTable.AddRequestHandler(queryReq, isAsync: true);
 
                         var queryResult = await SourceTable.DDBClient.QueryAsync(queryReq, cancellationToken).ConfigureAwait(false);
+                        count = Math.Max(0, count) + queryResult.Count;
+                        scannedCount = Math.Max(0, scannedCount) + queryResult.ScannedCount;
+
                         foreach (var item in queryResult.Items)
                         {
                             Document doc = SourceTable.FromAttributeMap(item);
@@ -442,6 +463,7 @@ namespace Amazon.DynamoDBv2.DocumentModel
 #endif
 
         private int count;
+        private int scannedCount;
 
         private SearchType SearchMethod { get; set; }
 
@@ -495,76 +517,86 @@ namespace Amazon.DynamoDBv2.DocumentModel
 
         private int GetCount()
         {
-            if (IsDone && CollectResults)
+            if (!IsDone || count == -1)
             {
-                return Matches.Count;
+                ExecuteCounts();
             }
-            else
+
+            return count;
+        }
+
+        private int GetScannedCount()
+        {
+            if (!IsDone || scannedCount == -1)
             {
-                if (count != -1)
-                {
-                    return count;
-                }
-                else
-                {
-                    switch (SearchMethod)
+                ExecuteCounts();
+            }
+
+            return scannedCount;
+        }
+
+        private void ExecuteCounts()
+        {
+            switch (SearchMethod)
+            {
+                case SearchType.Scan:
+                    ScanRequest scanReq = new ScanRequest
                     {
-                        case SearchType.Scan:
-                            ScanRequest scanReq = new ScanRequest
-                            {
-                                TableName = TableName,
-                                Select = EnumMapper.Convert(SelectValues.Count),
-                                ExclusiveStartKey = NextKey,
-                                ScanFilter = Filter.ToConditions(SourceTable.Conversion, SourceTable.IsEmptyStringValueEnabled),
-                                ConsistentRead = IsConsistentRead
-                            };
-                            if (!string.IsNullOrEmpty(this.IndexName))
-                                scanReq.IndexName = this.IndexName;
-                            if (this.FilterExpression != null && this.FilterExpression.IsSet)
-                                this.FilterExpression.ApplyExpression(scanReq, SourceTable);
-                            if (scanReq.ScanFilter != null && scanReq.ScanFilter.Count > 1)
-                                scanReq.ConditionalOperator = EnumMapper.Convert(ConditionalOperator);
+                        TableName = TableName,
+                        Select = EnumMapper.Convert(SelectValues.Count),
+                        ExclusiveStartKey = NextKey,
+                        ScanFilter = Filter.ToConditions(SourceTable.Conversion, SourceTable.IsEmptyStringValueEnabled),
+                        ConsistentRead = IsConsistentRead
+                    };
+                    if (!string.IsNullOrEmpty(this.IndexName))
+                        scanReq.IndexName = this.IndexName;
+                    if (this.FilterExpression != null && this.FilterExpression.IsSet)
+                        this.FilterExpression.ApplyExpression(scanReq, SourceTable);
+                    if (scanReq.ScanFilter != null && scanReq.ScanFilter.Count > 1)
+                        scanReq.ConditionalOperator = EnumMapper.Convert(ConditionalOperator);
 
-                            if (this.TotalSegments != 0)
-                            {
-                                scanReq.TotalSegments = this.TotalSegments;
-                                scanReq.Segment = this.Segment;
-                            }
-
-                            SourceTable.AddRequestHandler(scanReq, isAsync: false);
-
-                            var scanResult = SourceTable.DDBClient.Scan(scanReq);
-                            count = Matches.Count + scanResult.Count;
-                            return count;
-                        case SearchType.Query:
-                            QueryRequest queryReq = new QueryRequest
-                            {
-                                TableName = TableName,
-                                ConsistentRead = IsConsistentRead,
-                                Select = EnumMapper.Convert(SelectValues.Count),
-                                ExclusiveStartKey = NextKey,
-                                ScanIndexForward = !IsBackwardSearch,
-                                IndexName = IndexName
-                            };
-
-                            Expression.ApplyExpression(queryReq, SourceTable, KeyExpression, FilterExpression);
-                            Dictionary<string, Condition> keyConditions, filterConditions;
-                            SplitQueryFilter(Filter, SourceTable, queryReq.IndexName, out keyConditions, out filterConditions);
-                            queryReq.KeyConditions = keyConditions;
-                            queryReq.QueryFilter = filterConditions;
-
-                            if (queryReq.QueryFilter != null && queryReq.QueryFilter.Count > 1)
-                                queryReq.ConditionalOperator = EnumMapper.Convert(ConditionalOperator);
-
-                            SourceTable.AddRequestHandler(queryReq, isAsync: false);
-
-                            var queryResult = SourceTable.DDBClient.Query(queryReq);
-                            count = Matches.Count + queryResult.Count;
-                            return count;
-                        default:
-                            throw new InvalidOperationException("Unknown Search Method");
+                    if (this.TotalSegments != 0)
+                    {
+                        scanReq.TotalSegments = this.TotalSegments;
+                        scanReq.Segment = this.Segment;
                     }
-                }
+
+                    SourceTable.AddRequestHandler(scanReq, isAsync: false);
+
+                    var scanResult = SourceTable.DDBClient.Scan(scanReq);
+                    count = Math.Max(0, count) + scanResult.Count;
+                    scannedCount = Math.Max(0, scannedCount) + scanResult.ScannedCount;
+                    return;
+
+                case SearchType.Query:
+                    QueryRequest queryReq = new QueryRequest
+                    {
+                        TableName = TableName,
+                        ConsistentRead = IsConsistentRead,
+                        Select = EnumMapper.Convert(SelectValues.Count),
+                        ExclusiveStartKey = NextKey,
+                        ScanIndexForward = !IsBackwardSearch,
+                        IndexName = IndexName
+                    };
+
+                    Expression.ApplyExpression(queryReq, SourceTable, KeyExpression, FilterExpression);
+                    Dictionary<string, Condition> keyConditions, filterConditions;
+                    SplitQueryFilter(Filter, SourceTable, queryReq.IndexName, out keyConditions, out filterConditions);
+                    queryReq.KeyConditions = keyConditions;
+                    queryReq.QueryFilter = filterConditions;
+
+                    if (queryReq.QueryFilter != null && queryReq.QueryFilter.Count > 1)
+                        queryReq.ConditionalOperator = EnumMapper.Convert(ConditionalOperator);
+
+                    SourceTable.AddRequestHandler(queryReq, isAsync: false);
+
+                    var queryResult = SourceTable.DDBClient.Query(queryReq);
+                    count = Math.Max(0, count) + queryResult.Count;
+                    scannedCount = Math.Max(0, scannedCount) + queryResult.ScannedCount;
+                    return;
+                    
+                default:
+                    throw new InvalidOperationException("Unknown Search Method");
             }
         }
 
@@ -574,6 +606,7 @@ namespace Amazon.DynamoDBv2.DocumentModel
         internal void Reset()
         {
             count = -1;
+            scannedCount = -1;
             IsDone = false;
             NextKey = null;
             Matches = new List<Document>();
